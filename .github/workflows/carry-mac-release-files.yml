@@ -1,0 +1,70 @@
+# Keeps the macOS files reachable when a new release becomes "latest".
+#
+# TabGecko for macOS reads three files from releases/latest/download/:
+#   kernel-updates-darwin.json   signed kernel catalog
+#   latest-mac-arm64.yml         signed app update metadata (Apple Silicon)
+#   latest-mac-x64.yml           signed app update metadata (Intel)
+# and downloads the app archive named inside the update metadata from the same release.
+#
+# All of them are signed elsewhere. This job never creates or changes a signature; it only
+# copies files that a newly published release lacks from the newest release that has them.
+name: Carry macOS release files
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: carry-macos-release-files
+  cancel-in-progress: false
+jobs:
+  carry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy missing macOS files to the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view --json tagName -q .tagName)
+          echo "Latest release: $latest"
+          tags=$(gh release list --limit 100 --json tagName,publishedAt -q 'sort_by(.publishedAt) | reverse | .[].tagName')
+          has() { gh release view "$1" --json assets -q '.assets[].name' | grep -Fqx "$2"; }
+          carry() {
+            asset=$1
+            if has "$latest" "$asset"; then echo "$latest already has $asset"; return 0; fi
+            for tag in $tags; do
+              if [ "$tag" != "$latest" ] && has "$tag" "$asset"; then
+                rm -rf carry && mkdir carry
+                gh release download "$tag" --pattern "$asset" --dir carry
+                gh release upload "$latest" "carry/$asset"
+                echo "Copied $asset from $tag to $latest"
+                return 0
+              fi
+            done
+            echo "No release carries $asset yet"
+            return 1
+          }
+          carry kernel-updates-darwin.json || true
+          for arch in arm64 x64; do
+            metadata=latest-mac-$arch.yml
+            if has "$latest" "$metadata"; then echo "$latest already has $metadata"; continue; fi
+            # Find the archive the metadata names before moving anything, so the pair stays together.
+            source=""
+            for tag in $tags; do
+              if [ "$tag" != "$latest" ] && has "$tag" "$metadata"; then source=$tag; break; fi
+            done
+            if [ -z "$source" ]; then echo "No release carries $metadata yet"; continue; fi
+            rm -rf pair && mkdir pair
+            gh release download "$source" --pattern "$metadata" --dir pair
+            archive=$(sed -n 's/^ *- url: *\(TabGecko-[0-9][0-9.]*-mac-'"$arch"'\.zip\) *$/\1/p' "pair/$metadata" | head -n 1)
+            if [ -z "$archive" ]; then echo "Unexpected $metadata from $source; nothing copied"; continue; fi
+            if ! has "$latest" "$archive"; then
+              gh release download "$source" --pattern "$archive" --dir pair
+              gh release upload "$latest" "pair/$archive"
+            fi
+            gh release upload "$latest" "pair/$metadata"
+            echo "Copied $archive and $metadata from $source to $latest"
+          done
